@@ -5,9 +5,9 @@
   "description": "MizpahPulse WebSocket server for real-time event broadcasting",
   "main": "./src/index.ts",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "build": "tsc",
+    "dev": "node init && tsx watch src/index.ts",
+    "start": "node init && tsx src/index.ts",
+    "build": "node init && tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/*.test.ts",
     "clean": "rm -rf dist"

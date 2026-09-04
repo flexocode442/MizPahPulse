@@ -1,0 +1,71 @@
+# Auto-label pull requests by diff size (issue #72).
+#
+# Labels PRs `size/S`, `size/M`, `size/L`, or `size/XL` based on the total
+# number of changed lines (additions + deletions). Labels are created on
+# demand if they do not exist yet, and the previous size label is removed so
+# exactly one size label is present at any time. Thresholds are configurable
+# below.
+name: PR Size Label
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  size-label:
+    name: Apply size label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute diff size and apply label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
+
+            // Configurable thresholds (changed lines → size). Tune freely.
+            const THRESHOLDS = { S: 10, M: 100, L: 500, XL: 1000 };
+            const SIZE_LABELS = ['size/S', 'size/M', 'size/L', 'size/XL'];
+
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner, repo, pull_number: prNumber, per_page: 300,
+            });
+            const total = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);
+
+            let size = 'S';
+            for (const [label, threshold] of Object.entries(THRESHOLDS)) {
+              if (total > threshold) size = label;
+            }
+
+            const target = `size/${size}`;
+
+            // Ensure the label exists (first PR for a given size).
+            try {
+              await github.rest.issues.createLabel({
+                owner, repo, name: target, color: 'bfd4f2',
+              });
+            } catch (err) {
+              // Label already exists (HTTP 422) — ignore.
+            }
+
+            // Remove any other size label so exactly one is applied.
+            const { data: current } = await github.rest.issues.listLabelsOnIssue({
+              owner, repo, issue_number: prNumber,
+            });
+            for (const label of current.map((l) => l.name)) {
+              if (SIZE_LABELS.includes(label) && label !== target) {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber, name: label,
+                });
+              }
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: prNumber, labels: [target],
+            });
+
+            console.log(`PR #${prNumber}: ${total} changed lines → ${target}`);

@@ -234,3 +234,19 @@ model NotificationPreference {
 
   @@index([userId])
 }
+
+// ──────────────────────────────────────────────
+// Users (issue #55)
+// ──────────────────────────────────────────────
+// Auth-ready profile table. Existing models (ApiKey, WebhookSubscription,
+// MonitoredWallet, NotificationPreference, AuditLog) still reference `userId`
+// as a plain string for backward compatibility — those values map to
+// `User.id` (e.g. the seed's 'demo-user'). Adding foreign keys to those
+// tables is intentionally deferred until existing rows are migrated, to avoid
+// breaking inserts that predate the User table.
+model User {
+  id          String   @id @default(cuid())
+  address     String   @unique
+  displayName String?
+  createdAt   DateTime @default(now())
+}
