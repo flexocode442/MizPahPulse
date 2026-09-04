@@ -12,6 +12,7 @@ import { prisma, Prisma } from '@mizpah-pulse/database';
 import { v4 as uuidv4 } from 'uuid';
 import { startWebhookWorker } from './webhook-worker';
 import { startHealthServer, updateHealth, recordProcessedEvent } from './health-check';
+import { runEventRetention, parseRetentionDays, RETENTION_INTERVAL_MS } from './retention';
 import type { RawStellarEvent } from '@mizpah-pulse/types';
 
 /**
@@ -361,6 +362,39 @@ async function main() {
 
   // Start health server (exposes /health via HEALTH_PORT, default 8080)
   const stopHealthServer = startHealthServer();
+
+  // Start event retention/pruning (issue #53). Disabled unless
+  // EVENT_RETENTION_DAYS is set; runs once on startup, then on an interval.
+  await startRetentionJob();
+
+  // ──────────────────────────────────────────────
+  // Event Retention / Pruning (issue #53)
+  // ──────────────────────────────────────────────
+  async function startRetentionJob(): Promise<void> {
+    const retentionDays = parseRetentionDays(process.env.EVENT_RETENTION_DAYS);
+    if (retentionDays === null) {
+      console.log(
+        '[Retention] Disabled — set EVENT_RETENTION_DAYS (e.g. 90) to enable pruning of old events',
+      );
+      return;
+    }
+
+    const run = async () => {
+      try {
+        const result = await runEventRetention(retentionDays);
+        console.log(
+          `[Retention] Pruned ${result.deleted} events older than ${result.retentionDays} days ` +
+            `(cutoff ${result.cutoff.toISOString()}, ${result.batches} batch(es))`,
+        );
+      } catch (err) {
+        console.error('[Retention] Pruning error:', err);
+      }
+    };
+
+    await run();
+    const timer = setInterval(run, RETENTION_INTERVAL_MS);
+    activeTimers.push(timer);
+  }
 
   // Periodically refresh queue depth for health reporting
   const queueTimer = setInterval(async () => {

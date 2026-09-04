@@ -51,6 +51,7 @@ async function main() {
   await prisma.asset.deleteMany();
   await prisma.auditLog.deleteMany();
   await prisma.notificationPreference.deleteMany();
+  await prisma.user.deleteMany();
 
   console.log('  ✓ Cleaned existing data');
 
@@ -94,50 +95,83 @@ async function main() {
   });
   console.log('  ✓ Created demo webhook subscription');
 
-  // Seed events
+  // Seed the demo user (issue #55). Existing tables reference `userId` as a
+  // plain string; the demo rows use 'demo-user' to stay compatible.
+  await prisma.user.upsert({
+    where: { address: SAMPLE_ACCOUNTS[0] },
+    update: {},
+    create: {
+      id: 'demo-user',
+      address: SAMPLE_ACCOUNTS[0],
+      displayName: 'Demo User',
+    },
+  });
+  console.log('  ✓ Created demo user');
+
+  // Seed events spread across 7 days (issue #54). Each day follows a
+  // realistic hourly pattern: more activity during business hours (08:00-
+  // 21:00), quiet overnight. The seed cleans up existing rows first, so
+  // re-running it is idempotent.
   const now = new Date();
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const HOUR_MS = 60 * 60 * 1000;
   const events = [];
 
-  for (let i = 0; i < 50; i++) {
-    const eventType = EVENT_TYPES[i % EVENT_TYPES.length] || 'PAYMENT';
-    const accountId = SAMPLE_ACCOUNTS[i % SAMPLE_ACCOUNTS.length];
-    const contractId =
-      eventType === 'SOROBAN_INVOKE' ? SAMPLE_CONTRACTS[i % SAMPLE_CONTRACTS.length] : undefined;
-    const timestamp = new Date(now.getTime() - i * 30_000);
+  let index = 0;
+  for (let day = 6; day >= 0; day--) {
+    // Anchor each day at local midnight so the hourly pattern maps to real
+    // wall-clock hours: busy during 08:00–21:00, quiet overnight.
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day);
+    for (let hour = 0; hour < 24; hour++) {
+      const isPeak = hour >= 8 && hour <= 21;
+      const perHour = isPeak ? 3 : 1;
+      for (let slot = 0; slot < perHour; slot++) {
+        const eventType = EVENT_TYPES[index % EVENT_TYPES.length] || 'PAYMENT';
+        const accountId = SAMPLE_ACCOUNTS[index % SAMPLE_ACCOUNTS.length];
+        const contractId =
+          eventType === 'SOROBAN_INVOKE'
+            ? SAMPLE_CONTRACTS[index % SAMPLE_CONTRACTS.length]
+            : undefined;
+        const timestamp = new Date(dayStart.getTime() + hour * HOUR_MS + slot * 20 * 60_000);
+        // Never seed events in the future (today's remaining slots).
+        if (timestamp.getTime() > now.getTime()) continue;
 
-    events.push({
-      eventType,
-      source: i < 30 ? 'HORIZON' : 'SOROBAN_RPC',
-      category:
-        eventType === 'PAYMENT'
-          ? 'PAYMENT'
-          : eventType === 'SOROBAN_INVOKE'
-            ? 'CONTRACT'
-            : eventType === 'DEX_TRADE'
-              ? 'DEX'
-              : eventType === 'NFT_TRANSFER'
-                ? 'NFT'
-                : eventType === 'TOKEN_TRANSFER'
-                  ? 'TOKEN'
-                  : 'ACCOUNT',
-      transactionHash: `0x${uuidv4().replace(/-/g, '')}`,
-      ledgerSequence: BigInt(5_000_000 + i),
-      pagingToken: `paging-${uuidv4()}`,
-      timestamp,
-      accountId,
-      contractId,
-      assetCode: ['PAYMENT', 'TOKEN_TRANSFER'].includes(eventType) ? 'XLM' : undefined,
-      amount: ['PAYMENT', 'TOKEN_TRANSFER'].includes(eventType)
-        ? String(Math.floor(Math.random() * 1000) + 1)
-        : undefined,
-      payload: {
-        type: eventType,
-        source_account: accountId,
-      },
-      processedAt: timestamp,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    });
+        events.push({
+          eventType,
+          source: index % 2 === 0 ? 'HORIZON' : 'SOROBAN_RPC',
+          category:
+            eventType === 'PAYMENT'
+              ? 'PAYMENT'
+              : eventType === 'SOROBAN_INVOKE'
+                ? 'CONTRACT'
+                : eventType === 'DEX_TRADE'
+                  ? 'DEX'
+                  : eventType === 'NFT_TRANSFER'
+                    ? 'NFT'
+                    : eventType === 'TOKEN_TRANSFER'
+                      ? 'TOKEN'
+                      : 'ACCOUNT',
+          transactionHash: `0x${uuidv4().replace(/-/g, '')}`,
+          ledgerSequence: BigInt(5_000_000 + index),
+          pagingToken: `paging-${uuidv4()}`,
+          timestamp,
+          accountId,
+          contractId,
+          assetCode: ['PAYMENT', 'TOKEN_TRANSFER'].includes(eventType) ? 'XLM' : undefined,
+          amount: ['PAYMENT', 'TOKEN_TRANSFER'].includes(eventType)
+            ? String(Math.floor(Math.random() * 1000) + 1)
+            : undefined,
+          payload: {
+            type: eventType,
+            source_account: accountId,
+          },
+          processedAt: timestamp,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        });
+        index++;
+      }
+    }
   }
 
   // Create the parent Transaction rows first: the Event → Transaction
@@ -161,7 +195,7 @@ async function main() {
   for (const event of events) {
     await prisma.event.create({ data: event });
   }
-  console.log(`  ✓ Created ${events.length} events`);
+  console.log(`  ✓ Created ${events.length} events spanning 7 days`);
 
   // Seed audit logs
   const auditActions = ['API_REQUEST', 'WEBHOOK_DELIVERY', 'WALLET_CONNECT', 'CONTRACT_INVOKE'];
