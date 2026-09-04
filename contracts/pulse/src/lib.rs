@@ -1,4 +1,46 @@
 #![no_std]
+//! # PulseContract
+//!
+//! The MizPahPulse heartbeat contract: a Soroban smart contract that tracks
+//! and emits `pulse` events with caller tracking, plus ownership, pausability,
+//! multi-sig signer management, rate limiting, time-locked operations, batch
+//! pulsing, cross-contract broadcasting, a kill switch, and a configurable
+//! pulse-counter cap.
+//!
+//! ## Storage layout
+//!
+//! | Storage key (`Symbol`) | Scope | Type | Purpose |
+//! |------------------------|-------|------|---------|
+//! | `META` | instance | [`ContractMeta`] | Owner, paused flag, version |
+//! | `PULSE` | instance | [`PulseData`] | Counter, last caller, last pulse timestamp |
+//! | `RX_PULSE` | instance | `(u32, Symbol)` | Last cross-contract pulse received |
+//! | `MULTISIG` | instance | `(Vec<Address>, u32)` | Signer set + approval threshold |
+//! | `VERSION` | persistent | [`VersionRecord`] | Upgrade audit trail (version, timestamp, wasm hash) |
+//! | `MAX_COUNT` | instance | `u32` | Owner-configured pulse cap (unset = unlimited) |
+//!
+//! ## Error codes
+//!
+//! See [`PulseError`] for the full list; codes 1-10 are documented in
+//! `contracts/README.md` alongside the event topics.
+//!
+//! ## Example usage
+//!
+//! ```text
+//! // Deploy and initialize with the owner address.
+//! let (contract_id, client) = deploy_initialized(&env, &owner);
+//!
+//! // Fire pulses and read state.
+//! client.pulse(&symbol_short!("alice"));            // -> Ok(1)
+//! client.get_pulse_count();                         // -> 1
+//! client.get_version();                             // -> 1
+//!
+//! // Owner-only operations (require auth).
+//! client.set_max_pulse_count(&1000);                // cap the counter
+//! client.pause();                                   // emergency circuit breaker
+//! ```
+//!
+//! See `contracts/README.md` in the repository root for deployment and
+//! interaction instructions.
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, Address, Env, IntoVal,
     Symbol, Val, Vec,
@@ -27,6 +69,10 @@ pub enum PulseError {
     TimeLockNotReady = 7,
     /// Rate-limited operation attempted within the active cooldown window
     CooldownActive = 8,
+    /// Pulse count cap configured by the owner has been reached
+    PulseCapReached = 9,
+    /// Time-locked operation attempted after its absolute deadline
+    TimeLockExpired = 10,
 }
 
 /// Counter for tracking pulse events
@@ -55,6 +101,10 @@ const META_KEY: Symbol = symbol_short!("META");
 
 /// Key for storing the last received pulse
 const RX_PULSE_KEY: Symbol = symbol_short!("RX_PULSE");
+
+/// Key for storing the owner-configured maximum pulse count (issue #64).
+/// When unset, the cap defaults to `u32::MAX` (effectively unlimited).
+const MAX_PULSE_COUNT_KEY: Symbol = symbol_short!("MAX_COUNT");
 
 /// ──────────────────────────────────────────────
 /// Event Topics
@@ -169,7 +219,7 @@ impl PulseContract {
     /// Get the current contract version.
     ///
     /// Returns `0` when the contract has not been initialized yet and the
-    /// recorded version (starting at `1` after [`Self::initialize`]) otherwise.
+    /// recorded version (starting at `1` after `initialize`) otherwise.
     pub fn get_version(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -312,11 +362,17 @@ impl PulseContract {
     /// ── Time-Locked Operations ────────────────
 
     /// Fire a pulse that only executes after a specified ledger timestamp.
-    /// This demonstrates time-locked operations useful for vesting, auctions, etc.
+    ///
+    /// `execute_after` is a not-before constraint. `execute_before` is an
+    /// optional absolute deadline (not-after): when set, the pulse is rejected
+    /// once the ledger timestamp passes it, preventing stale queued
+    /// operations from ever executing (issue #57). Pass `None` to keep the
+    /// operation open-ended, which preserves the original behavior.
     pub fn time_locked_pulse(
         env: Env,
         caller: Symbol,
         execute_after: u64,
+        execute_before: Option<u64>,
     ) -> Result<u32, PulseError> {
         ensure_not_paused(&env)?;
 
@@ -324,8 +380,38 @@ impl PulseContract {
         if now < execute_after {
             return Err(PulseError::TimeLockNotReady);
         }
+        if let Some(deadline) = execute_before {
+            if now > deadline {
+                return Err(PulseError::TimeLockExpired);
+            }
+        }
 
         Self::pulse(env, caller)
+    }
+
+    /// ── Pulse Counter Cap (issue #64) ─────────
+
+    /// Configure the maximum pulse count (only owner).
+    ///
+    /// Once the counter reaches this value, `pulse()` and `batch_pulse()` are
+    /// rejected with [`PulseError::PulseCapReached`]. The cap is stored on
+    /// chain and can be raised or lowered at any time; raising it re-enables
+    /// pulsing. When unset the cap is `u32::MAX` (effectively unlimited).
+    pub fn set_max_pulse_count(env: Env, max_count: u32) -> Result<(), PulseError> {
+        get_or_create_meta(&env).owner.require_auth();
+
+        env.storage().instance().set(&MAX_PULSE_COUNT_KEY, &max_count);
+
+        env.events()
+            .publish((symbol_short!("config"), symbol_short!("cap")), max_count);
+
+        log!(&env, "Maximum pulse count set to {}", max_count);
+        Ok(())
+    }
+
+    /// Get the configured maximum pulse count (`u32::MAX` when unset).
+    pub fn get_max_pulse_count(env: Env) -> u32 {
+        pulse_cap(&env)
     }
 
     /// ── Rate-Limited Pulse with Cooldown ─────
@@ -455,11 +541,16 @@ impl PulseContract {
                 last_pulse_at: None,
             });
 
-        // Increment with overflow protection
+        // Increment with overflow protection, then enforce the owner-configured
+        // cap (issue #64). The counter is not persisted until after the checks,
+        // so a rejected pulse leaves storage untouched.
         data.count = data
             .count
             .checked_add(1)
             .ok_or(PulseError::CounterOverflow)?;
+        if data.count > pulse_cap(&env) {
+            return Err(PulseError::PulseCapReached);
+        }
         data.last_caller = Some(caller.clone());
         data.last_pulse_at = Some(env.ledger().timestamp());
 
@@ -524,10 +615,14 @@ impl PulseContract {
             });
 
         let batch_size = callers.len() as u32;
-        data.count = data
+        let new_count = data
             .count
             .checked_add(batch_size)
             .ok_or(PulseError::CounterOverflow)?;
+        if new_count > pulse_cap(&env) {
+            return Err(PulseError::PulseCapReached);
+        }
+        data.count = new_count;
         let last = callers.last().unwrap();
         data.last_caller = Some(last.clone());
         data.last_pulse_at = Some(env.ledger().timestamp());
@@ -616,6 +711,14 @@ impl PulseContract {
 /// ──────────────────────────────────────────────
 /// Internal Helpers
 /// ──────────────────────────────────────────────
+
+/// Read the configured pulse cap, defaulting to `u32::MAX` (unlimited).
+fn pulse_cap(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get::<Symbol, u32>(&MAX_PULSE_COUNT_KEY)
+        .unwrap_or(u32::MAX)
+}
 
 fn get_or_create_meta(env: &Env) -> ContractMeta {
     env.storage()
