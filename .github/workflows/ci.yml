@@ -168,6 +168,26 @@ jobs:
           retention-days: 30
 
   # ──────────────────────────────────────
+  # Contract WASM Reproducibility (main only, issue #79)
+  # ──────────────────────────────────────
+  contract-reproducibility:
+    name: Contract WASM Reproducibility
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Verify WASM reproducibility
+        # Builds the contract twice into isolated target dirs and compares
+        # sha256 hashes of the resulting WASM artifacts.
+        run: bash scripts/verify-wasm-reproducibility.sh
+
+  # ──────────────────────────────────────
   # Contract Deployment (manual trigger on main)
   # Requires GitHub Secrets: DEPLOYER_SECRET
   # ──────────────────────────────────────
