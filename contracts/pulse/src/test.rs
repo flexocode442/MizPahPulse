@@ -8,6 +8,26 @@ use soroban_sdk::testutils::Events;
 use soroban_sdk::testutils::Ledger;
 use soroban_sdk::Env;
 
+/// Extract the primary and secondary topic symbols from every emitted event.
+/// Soroban SDK 21 exposes events as `(contract_id, topics, data)` tuples where
+/// `topics` is a `Vec<Val>`; events with a single topic carry `None` secondary.
+/// Uses `std::vec::Vec` explicitly because the crate is `#![no_std]`.
+fn emitted_topic_pairs(env: &Env) -> std::vec::Vec<(Symbol, Option<Symbol>)> {
+    use soroban_sdk::TryFromVal;
+    env.events()
+        .all()
+        .iter()
+        .map(|(_contract_id, topics, _data)| {
+            let primary = topics
+                .get(0)
+                .map(|v| Symbol::try_from_val(env, &v).unwrap())
+                .expect("events always carry a primary topic");
+            let secondary = topics.get(1).map(|v| Symbol::try_from_val(env, &v).unwrap());
+            (primary, secondary)
+        })
+        .collect::<std::vec::Vec<_>>()
+}
+
 fn deploy(env: &Env) -> (Address, PulseContractClient) {
     let contract_id = env.register_contract(None, PulseContract);
     let client = PulseContractClient::new(env, &contract_id);
@@ -442,15 +462,163 @@ fn test_time_locked_pulse_rejects_before_deadline() {
     // Set the ledger to a concrete time so the deadline is deterministic.
     env.ledger().set_timestamp(1_000_000);
 
-    let result = client.try_time_locked_pulse(&symbol_short!("alice"), &1_500_000u64);
+    let result = client.try_time_locked_pulse(&symbol_short!("alice"), &1_500_000u64, &None);
     // try_* returns Result<T, Result<PulseError, InvokeError>>; a typed
     // contract error surfaces as Ok(PulseError::...) inside the outer Err.
     assert_eq!(result.unwrap_err(), Ok(PulseError::TimeLockNotReady));
 
     // After the deadline the pulse fires normally.
     env.ledger().set_timestamp(2_000_000);
-    let count = client.time_locked_pulse(&symbol_short!("alice"), &1_500_000u64);
+    let count = client.time_locked_pulse(&symbol_short!("alice"), &1_500_000u64, &None);
     assert_eq!(count, 1u32);
+}
+
+#[test]
+fn test_time_locked_pulse_rejects_after_deadline() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+
+    // execute_after (not-before) has passed, but the absolute deadline
+    // (not-after) has also expired — the pulse must be rejected.
+    env.ledger().set_timestamp(2_000_000);
+    let result = client.try_time_locked_pulse(
+        &symbol_short!("alice"),
+        &1_000_000u64,
+        &Some(1_500_000u64),
+    );
+    assert_eq!(result.unwrap_err(), Ok(PulseError::TimeLockExpired));
+}
+
+#[test]
+fn test_time_locked_pulse_executes_within_window() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+
+    env.ledger().set_timestamp(1_250_000);
+    let count = client.time_locked_pulse(
+        &symbol_short!("alice"),
+        &1_000_000u64,
+        &Some(1_500_000u64),
+    );
+    assert_eq!(count, 1u32);
+}
+
+#[test]
+fn test_time_locked_pulse_unset_deadline_unchanged() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+
+    // None keeps the original open-ended behavior: only the not-before
+    // constraint applies, even well past any would-be deadline.
+    env.ledger().set_timestamp(2_000_000);
+    let count = client.time_locked_pulse(&symbol_short!("alice"), &1_000_000u64, &None);
+    assert_eq!(count, 1u32);
+}
+
+#[test]
+fn test_set_max_pulse_count_requires_owner() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+
+    let result = client.try_set_max_pulse_count(&100u32);
+    assert!(result.is_err(), "non-owner must not configure the pulse cap");
+}
+
+#[test]
+fn test_max_pulse_count_default_unlimited() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+
+    assert_eq!(client.get_max_pulse_count(), u32::MAX);
+    // Without a cap configured, pulsing is not artificially limited.
+    for i in 0..10u32 {
+        assert_eq!(client.pulse(&symbol_short!("alice")), i + 1);
+    }
+    assert_eq!(client.get_pulse_count(), 10);
+}
+
+#[test]
+fn test_pulse_rejected_once_cap_reached() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+    env.mock_all_auths();
+    client.set_max_pulse_count(&3u32);
+
+    assert_eq!(client.pulse(&symbol_short!("alice")), 1);
+    assert_eq!(client.pulse(&symbol_short!("bob")), 2);
+    assert_eq!(client.pulse(&symbol_short!("carol")), 3);
+
+    let result = client.try_pulse(&symbol_short!("dave"));
+    assert_eq!(result.unwrap_err(), Ok(PulseError::PulseCapReached));
+    // The rejected pulse must not have changed stored state.
+    assert_eq!(client.get_pulse_count(), 3);
+}
+
+#[test]
+fn test_batch_pulse_respects_cap() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+    env.mock_all_auths();
+    client.set_max_pulse_count(&5u32);
+
+    let first = Vec::from_array(&env, [
+        symbol_short!("a"),
+        symbol_short!("b"),
+        symbol_short!("c"),
+    ]);
+    assert_eq!(client.batch_pulse(&first), 3u32);
+
+    // The next batch would push the counter past the cap.
+    let second = Vec::from_array(&env, [
+        symbol_short!("d"),
+        symbol_short!("e"),
+        symbol_short!("f"),
+    ]);
+    let result = client.try_batch_pulse(&second);
+    assert_eq!(result.unwrap_err(), Ok(PulseError::PulseCapReached));
+    assert_eq!(client.get_pulse_count(), 3);
+}
+
+#[test]
+fn test_raise_cap_re_enables_pulsing() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+    env.mock_all_auths();
+
+    client.set_max_pulse_count(&2u32);
+    assert_eq!(client.pulse(&symbol_short!("alice")), 1);
+    assert_eq!(client.pulse(&symbol_short!("bob")), 2);
+    assert!(client.try_pulse(&symbol_short!("carol")).is_err());
+
+    // Raising the cap re-enables pulsing without resetting the counter.
+    client.set_max_pulse_count(&5u32);
+    assert_eq!(client.pulse(&symbol_short!("carol")), 3);
+}
+
+#[test]
+fn test_set_max_pulse_count_emits_config_event() {
+    let env = Env::default();
+    let owner = make_owner(&env);
+    let (_id, client) = deploy_initialized(&env, &owner);
+    env.mock_all_auths();
+
+    client.set_max_pulse_count(&1_000u32);
+
+    let topics = emitted_topic_pairs(&env);
+    assert!(
+        topics
+            .iter()
+            .any(|(t0, t1)| t0 == &symbol_short!("config") && t1 == &Some(symbol_short!("cap"))),
+        "set_max_pulse_count must emit a config/cap event, got {topics:?}"
+    );
 }
 
 #[test]
@@ -513,26 +681,6 @@ fn test_get_version() {
 }
 
 /// ── Event topics (issue #60) ───────────────────────────────────────────
-
-/// Extract the primary and secondary topic symbols from every emitted event.
-/// Soroban SDK 21 exposes events as `(contract_id, topics, data)` tuples where
-/// `topics` is a `Vec<Val>`; events with a single topic carry `None` secondary.
-/// Uses `std::vec::Vec` explicitly because the crate is `#![no_std]`.
-fn emitted_topic_pairs(env: &Env) -> std::vec::Vec<(Symbol, Option<Symbol>)> {
-    use soroban_sdk::TryFromVal;
-    env.events()
-        .all()
-        .iter()
-        .map(|(_contract_id, topics, _data)| {
-            let primary = topics
-                .get(0)
-                .map(|v| Symbol::try_from_val(env, &v).unwrap())
-                .expect("events always carry a primary topic");
-            let secondary = topics.get(1).map(|v| Symbol::try_from_val(env, &v).unwrap());
-            (primary, secondary)
-        })
-        .collect::<std::vec::Vec<_>>()
-}
 
 #[test]
 fn test_set_signers_emits_updated_event() {

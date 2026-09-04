@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "prConcurrentLimit": 5,
+  "schedule": ["on monday"],
+  "packageRules": [
+    {
+      "matchManagers": ["npm"],
+      "matchPackageNames": ["@mizpah-pulse/*"],
+      "groupName": "mizpah-pulse workspace dependencies"
+    },
+    {
+      "matchManagers": ["npm", "cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "minor and patch updates"
+    },
+    {
+      "matchManagers": ["npm", "cargo"],
+      "matchUpdateTypes": ["patch"],
+      "automerge": true
+    }
+  ]
+}
